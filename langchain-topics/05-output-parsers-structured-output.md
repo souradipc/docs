@@ -13,14 +13,35 @@ LLMs return plain text. Output parsers transform that text into structured Pytho
 
 ## Parser Types — Quick Reference
 
-| Parser | Output Type | Method |
-|---|---|---|
-| `StrOutputParser` | `str` | Text extraction |
-| `JsonOutputParser` | `dict` | JSON mode parsing |
-| `PydanticOutputParser` | Pydantic model | Instructions + parsing |
-| `with_structured_output()` | Pydantic / dict | Native tool calling |
-| `XMLOutputParser` | `dict` | XML parsing |
-| `CommaSeparatedListOutputParser` | `list[str]` | Simple list splitting |
+| Parser | Output Type | Method | When to Use |
+|---|---|---|---|
+| `StrOutputParser` | `str` | Text extraction | Simple text responses, no structure needed |
+| `JsonOutputParser` | `dict` | JSON mode parsing | Model returns raw JSON, no strict schema |
+| `PydanticOutputParser` | Pydantic model | Instructions + parsing | Older models without tool-calling support |
+| `PydanticToolsParser` | `list[Pydantic]` | Tool call parsing | Extract **multiple** structured objects from tool calls |
+| `JsonOutputToolsParser` | `list[dict]` | Tool call parsing | Extract tool call args as raw dicts (no schema validation) |
+| `JsonOutputKeyToolsParser` | `list[dict]` | Tool call parsing | Filter tool calls by a specific tool name |
+| `with_structured_output()` | Pydantic / dict | Native tool calling | **Recommended default** — single structured response |
+| `XMLOutputParser` | `dict` | XML parsing | Models that output XML (e.g., Anthropic Claude legacy) |
+| `CommaSeparatedListOutputParser` | `list[str]` | Simple list splitting | Quick comma-separated lists, no structure needed |
+| `OutputFixingParser` | Any | Auto-retry wrapper | Wrap any parser for auto-repair on malformed output |
+
+### Decision Guide — Which Parser to Use?
+
+```
+Do you need structured output?
+├── No → StrOutputParser
+└── Yes
+    ├── Model supports tool calling (GPT-4, Claude 3+, Gemini)?
+    │   ├── Single object → with_structured_output()  ✅ recommended
+    │   ├── Multiple tool calls / objects → PydanticToolsParser
+    │   ├── Raw dicts (no Pydantic) → JsonOutputToolsParser
+    │   └── Filter by tool name → JsonOutputKeyToolsParser
+    ├── Model does NOT support tool calling (older models)?
+    │   └── PydanticOutputParser or JsonOutputParser
+    ├── Model outputs XML? → XMLOutputParser
+    └── Simple list? → CommaSeparatedListOutputParser
+```
 
 ---
 
@@ -187,6 +208,117 @@ for partial in structured_stream.stream("Analyze cybersecurity trends"):
     print(partial)  # Partial Analysis objects
     # {'topic': 'cyber'} → {'topic': 'cybersecurity'} → {'topic': 'cybersecurity', 'summary': ''} ...
 ```
+
+---
+
+## `PydanticToolsParser` — Multiple Structured Objects from Tool Calls
+
+Use when you want to extract **multiple typed objects** from a single model response using tool calling. The model may call multiple tools in one response; this parser maps each call to its corresponding Pydantic model.
+
+```python
+from langchain_core.output_parsers.openai_tools import PydanticToolsParser
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+from typing import List
+
+class MalwareIndicator(BaseModel):
+    """Represents a single malware indicator of compromise."""
+    ioc_type: str = Field(description="Type: hash, ip, domain, url")
+    value: str = Field(description="The actual IOC value")
+    confidence: str = Field(description="Confidence level: low/medium/high")
+
+class ThreatActor(BaseModel):
+    """Represents a threat actor mentioned in the report."""
+    name: str = Field(description="Threat actor name or alias")
+    motivation: str = Field(description="Primary motivation: espionage/financial/hacktivist")
+
+model = ChatOpenAI(model="gpt-4o")
+
+# Bind both tools so the model can call either (or both) in one response
+model_with_tools = model.bind_tools([MalwareIndicator, ThreatActor])
+parser = PydanticToolsParser(tools=[MalwareIndicator, ThreatActor])
+
+chain = model_with_tools | parser
+
+results = chain.invoke(
+    "Extract all IOCs and threat actors from: APT29 used domain evil.ru and hash abc123 to deploy malware."
+)
+# results is a list — each item is either a MalwareIndicator or ThreatActor instance
+for item in results:
+    print(type(item).__name__, item)
+```
+
+**When to use:** You need to extract several different structured objects in one pass — e.g., IOCs + threat actors + CVEs from a single threat report.
+
+---
+
+## `JsonOutputToolsParser` — Raw Tool Call Dicts (No Schema)
+
+Same as `PydanticToolsParser` but returns plain `list[dict]` instead of Pydantic instances. Useful when you don't have a Pydantic model or want raw flexibility.
+
+```python
+from langchain_core.output_parsers.openai_tools import JsonOutputToolsParser
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(model="gpt-4o")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_alert",
+            "description": "Extract alert details",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["severity", "description"],
+            },
+        },
+    }
+]
+
+model_with_tools = model.bind_tools(tools)
+parser = JsonOutputToolsParser()  # Returns list of {"type": "tool_name", "args": {...}}
+
+chain = model_with_tools | parser
+
+results = chain.invoke("High severity SQL injection detected on login endpoint.")
+# [{"type": "extract_alert", "args": {"severity": "high", "description": "SQL injection..."}}]
+print(results[0]["args"]["severity"])  # "high"
+```
+
+**When to use:** You have dynamic or schema-less tools, or you want raw dicts without Pydantic validation overhead.
+
+---
+
+## `JsonOutputKeyToolsParser` — Filter by Specific Tool Name
+
+A focused variant of `JsonOutputToolsParser` that only returns calls to **one specific tool**, ignoring others. Handy when the model can call multiple tools but you only care about one.
+
+```python
+from langchain_core.output_parsers.openai_tools import JsonOutputKeyToolsParser
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(model="gpt-4o")
+
+# Model is bound to multiple tools but we only want results from "extract_cve"
+model_with_tools = model.bind_tools([extract_cve_tool, extract_ioc_tool])
+
+# Only parse calls to "extract_cve", ignore everything else
+parser = JsonOutputKeyToolsParser(key_name="extract_cve")
+
+chain = model_with_tools | parser
+
+results = chain.invoke("CVE-2024-1234 and CVE-2024-5678 were exploited via a phishing email.")
+# Only extract_cve tool call args are returned
+# [{"cve_id": "CVE-2024-1234", ...}, {"cve_id": "CVE-2024-5678", ...}]
+```
+
+**When to use:** The model has access to multiple tools but downstream you only need results from one specific tool — avoids manually filtering the list yourself.
 
 ---
 
